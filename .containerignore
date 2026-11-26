@@ -1,0 +1,13 @@
+# Build context exclusions for the Containerfile.
+# The image needs Containerfile + patches/ + run.sh only; the ~73 GB
+# checkpoint, caches, logs, VCS data and the example/ recipes must never be
+# sent to the builder.
+.git
+.gitignore
+.cache
+models
+*.log
+.env
+example
+__pycache__
+*.pyc

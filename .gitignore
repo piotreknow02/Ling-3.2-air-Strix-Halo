@@ -1,0 +1,9 @@
+# Local config (copy from .env.sample)
+.env
+
+# 72.5 GiB checkpoint + caches — never commit
+models/
+.cache/
+
+# Runtime log
+.ling32.log

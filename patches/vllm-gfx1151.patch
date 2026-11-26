@@ -1,0 +1,412 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1612b33d1..41d4b10f0 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -169,6 +169,7 @@ if TYPE_CHECKING:
+     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
++    VLLM_ROCM_SAFE_MERGE_ATTN_STATES: bool = False
+     VLLM_ROCM_FP8_PADDING: bool = True
+     VLLM_ROCM_MOE_PADDING: bool = True
+     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+@@ -1489,6 +1490,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
+         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+     ),
++    # Use the safe Torch attention-state merge on ROCm. This is an opt-in
++    # fallback for platforms where the Triton merge kernel is unstable.
++    "VLLM_ROCM_SAFE_MERGE_ATTN_STATES": lambda: (
++        os.getenv("VLLM_ROCM_SAFE_MERGE_ATTN_STATES", "False").lower()
++        in ("true", "1")
++    ),
+     # Pad the fp8 weights to 256 bytes for ROCm
+     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
+     # Pad the weights for the moe kernel
+diff --git a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+index d40d1a8b4..ca6ae2d21 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
+ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+     moe_align_block_size,
+ )
++from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_sum_decode
+ from vllm.model_executor.layers.fused_moe.moe_output import route_major_moe_output
+ from vllm.model_executor.layers.fused_moe.silu_mul_token_quant import (
+     silu_mul_token_quant,
+@@ -104,6 +105,96 @@ def _silu_mul_quant_sorted_kernel(
+     tl.store(scale_ptr + rows * (intermediate // GROUP_K) + tl.program_id(1), scale)
+ 
+ 
++def _use_wna16_naive_block_assignment(
++    *,
++    num_tokens: int,
++    top_k: int,
++    num_experts: int,
++    global_num_experts: int,
++    block_size_m: int,
++    expert_map: torch.Tensor | None,
++    use_int4_w4a16: bool,
++    block_shape: list[int] | None,
++) -> bool:
++    """Select the narrowly validated gfx1151 WNA16 small-token fast path."""
++    return (
++        num_tokens in (1, 2, 3)
++        and top_k == 8
++        and num_experts == 512
++        and global_num_experts == 512
++        and block_size_m == 16
++        and expert_map is None
++        and use_int4_w4a16
++        and block_shape == [0, 32]
++    )
++
++
++_WNA16_SILU_OUTPUT_SIZE = 768
++_WNA16_SILU_BLOCK_SIZE = 128
++
++
++@triton.jit
++def _wna16_exact_silu_and_mul_kernel(
++    input_ptr,
++    output_ptr,
++    OUTPUT_SIZE: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    row = tl.program_id(0)
++    block = tl.program_id(1)
++    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = offsets < OUTPUT_SIZE
++    row_input = input_ptr + row * (2 * OUTPUT_SIZE)
++    gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
++    up = tl.load(row_input + OUTPUT_SIZE + offsets, mask=mask, other=0.0).to(
++        tl.float32
++    )
++
++    # Match the native packed HIP kernel's intermediate BF16 rounding.
++    activated = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
++    tl.store(
++        output_ptr + row * OUTPUT_SIZE + offsets,
++        activated * up,
++        mask=mask,
++    )
++
++
++def _use_wna16_exact_silu_and_mul(
++    output: torch.Tensor, input: torch.Tensor
++) -> bool:
++    if torch.compiler.is_compiling() or not current_platform.is_rocm():
++        return False
++    from vllm.platforms.rocm import on_gfx1151
++
++    return (
++        on_gfx1151()
++        and input.is_cuda
++        and output.is_cuda
++        and input.dtype == torch.bfloat16
++        and output.dtype == torch.bfloat16
++        and input.is_contiguous()
++        and output.is_contiguous()
++        and input.shape in ((8, 1536), (16, 1536))
++        and output.shape == (input.shape[0], _WNA16_SILU_OUTPUT_SIZE)
++    )
++
++
++def _invoke_wna16_exact_silu_and_mul(
++    output: torch.Tensor, input: torch.Tensor
++) -> None:
++    grid = (
++        input.shape[0],
++        triton.cdiv(_WNA16_SILU_OUTPUT_SIZE, _WNA16_SILU_BLOCK_SIZE),
++    )
++    _wna16_exact_silu_and_mul_kernel[grid](
++        input,
++        output,
++        OUTPUT_SIZE=_WNA16_SILU_OUTPUT_SIZE,
++        BLOCK_SIZE=_WNA16_SILU_BLOCK_SIZE,
++        num_warps=1,
++    )
++
++
+ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+     """Triton-based fused MoE expert implementation."""
+ 
+@@ -882,6 +973,33 @@ class TritonWNA16Experts(TritonExperts):
+             or moe_parallel_config.use_fi_nvl_one_sided_kernels
+         )
+ 
++    def activation(
++        self,
++        activation: MoEActivation,
++        output: torch.Tensor,
++        input: torch.Tensor,
++        **kwargs,
++    ) -> None:
++        # Keep compiled MLA-side MoE activations on Inductor's fused pointwise
++        # route. The exact KDA-side eager shapes otherwise pay the high fixed
++        # latency of the generic HIP activation kernel on gfx1151.
++        if (
++            activation == MoEActivation.SILU
++            and self.activation_config.clamp_limit is None
++            and self.quant_config.use_int4_w4a16
++            and self.block_shape == [0, 32]
++            and _use_wna16_exact_silu_and_mul(output, input)
++        ):
++            _invoke_wna16_exact_silu_and_mul(output, input)
++            return
++
++        super().activation(
++            activation,
++            output,
++            input,
++            **kwargs,
++        )
++
+     def apply(
+         self,
+         output: torch.Tensor,
+@@ -962,9 +1080,35 @@ class TritonWNA16Experts(TritonExperts):
+ 
+         # Include fused shared-expert rows while preserving EP remapping.
+         num_align_experts = w1.shape[0] if expert_map is None else global_num_experts
+-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+-            topk_ids, config["BLOCK_SIZE_M"], num_align_experts, expert_map
++        use_naive_block_assignment = _use_wna16_naive_block_assignment(
++            num_tokens=num_tokens,
++            top_k=top_k_num,
++            num_experts=E,
++            global_num_experts=global_num_experts,
++            block_size_m=config["BLOCK_SIZE_M"],
++            expert_map=expert_map,
++            use_int4_w4a16=self.quant_config.use_int4_w4a16,
++            block_shape=self.block_shape,
++        )
++        use_naive_block_assignment = (
++            use_naive_block_assignment
++            and topk_ids.shape == (num_tokens, top_k_num)
++            and topk_ids.is_contiguous()
+         )
++        if use_naive_block_assignment:
++            sorted_token_ids = None
++            expert_ids = topk_ids.view(-1)
++            # Compile-time dead in the naive kernel specialization.
++            num_tokens_post_padded = expert_ids
++        else:
++            sorted_token_ids, expert_ids, num_tokens_post_padded = (
++                moe_align_block_size(
++                    topk_ids,
++                    config["BLOCK_SIZE_M"],
++                    num_align_experts,
++                    expert_map,
++                )
++            )
+ 
+         invoke_fused_moe_wna16_triton_kernel(
+             hidden_states,
+@@ -1019,5 +1163,20 @@ class TritonWNA16Experts(TritonExperts):
+             num_input_tokens=num_tokens,
+         )
+ 
+-        # separate function is required for MoE + LoRA
+-        self.moe_sum(intermediate_cache3, output)
++        # The native HIP top-k sum has very high fixed latency on gfx1151 for
++        # the exact target-decode and K1/K2 verification shapes. Keep every
++        # adjacent shape on the native implementation.
++        if (
++            use_naive_block_assignment
++            and self._lora_context is None
++            and intermediate_cache3.shape
++            in ((1, 8, 2560), (2, 8, 2560), (3, 8, 2560))
++            and output.shape in ((1, 2560), (2, 2560), (3, 2560))
++            and output.shape[0] == intermediate_cache3.shape[0]
++            and intermediate_cache3.is_contiguous()
++            and output.is_contiguous()
++        ):
++            moe_sum_decode(intermediate_cache3, output)
++        else:
++            # separate function is required for MoE + LoRA
++            self.moe_sum(intermediate_cache3, output)
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 28642a016..d29d1e442 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -101,6 +101,7 @@ def fused_moe_kernel_gptq_awq(
+     stride_bzn,
+     block_k_diviable: tl.constexpr,
+     group_size: tl.constexpr,
++    naive_block_assignment: tl.constexpr,
+     # Meta-parameters
+     BLOCK_SIZE_M: tl.constexpr,
+     BLOCK_SIZE_N: tl.constexpr,
+@@ -160,12 +161,20 @@ def fused_moe_kernel_gptq_awq(
+     # and accumulate
+     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+-        return
+-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    if not naive_block_assignment:
++        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
++        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
++            return
++        offs_token_id = pid_m * BLOCK_SIZE_M + offs
++        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
++    else:
++        # Decode-only fast path: one routed token per program.  The remaining
++        # lanes are masked so no alignment, sorting, or padded-count load is
++        # needed.
++        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+     # Cast to int64 to prevent overflow in stride*offset products
+-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
++    offs_token = offs_token.to(tl.int64)
+     token_mask = offs_token < num_valid_tokens
+ 
+     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+@@ -696,7 +705,7 @@ def invoke_fused_moe_wna16_cuda_kernel(
+     B_scale: torch.Tensor | None,
+     B_zp: torch.Tensor | None,
+     topk_weights: torch.Tensor | None,
+-    sorted_token_ids: torch.Tensor,
++    sorted_token_ids: torch.Tensor | None,
+     expert_ids: torch.Tensor,
+     num_tokens_post_padded: torch.Tensor,
+     mul_routed_weight: bool,
+@@ -773,8 +782,11 @@ def invoke_fused_moe_wna16_triton_kernel(
+     M = A.size(0)
+     num_tokens = M * top_k
+ 
+-    EM = sorted_token_ids.size(0)
+-    if A.size(0) < config["BLOCK_SIZE_M"]:
++    if sorted_token_ids is None:
++        EM = num_tokens * config["BLOCK_SIZE_M"]
++    else:
++        EM = sorted_token_ids.size(0)
++    if sorted_token_ids is not None and A.size(0) < config["BLOCK_SIZE_M"]:
+         # optimize for small batch_size.
+         # We assume that top_ids of each token is unique,
+         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
+@@ -870,6 +882,7 @@ def invoke_fused_moe_wna16_triton_kernel(
+         use_int4_w4a16=use_int4_w4a16,
+         use_int8_w8a16=use_int8_w8a16,
+         USE_TD=use_td,
++        naive_block_assignment=(sorted_token_ids is None),
+         **config,
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py b/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py
+index 63d33eadd..c9c5d9d2f 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py
++++ b/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py
+@@ -7,6 +7,55 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
+ 
++@triton.jit
++def moe_sum_decode_kernel(
++    input_ptr,
++    output_ptr,
++    size: tl.constexpr,
++    top_k: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    """Sum a small token batch's routed outputs in fixed route order."""
++    token = tl.program_id(1)
++    offsets = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
++    mask = offsets < size
++    accumulator = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    for route in tl.static_range(top_k):
++        value = tl.load(
++            input_ptr + (token * top_k + route) * size + offsets,
++            mask=mask,
++            other=0.0,
++        )
++        accumulator += value.to(tl.float32)
++    tl.store(output_ptr + token * size + offsets, accumulator, mask=mask)
++
++
++def moe_sum_decode(
++    inputs: torch.Tensor,
++    output: torch.Tensor,
++) -> torch.Tensor:
++    """Low-launch-overhead sum for exact Ling WNA16 decode/verify shapes."""
++    assert inputs.shape in ((1, 8, 2560), (2, 8, 2560), (3, 8, 2560))
++    assert output.shape in ((1, 2560), (2, 2560), (3, 2560))
++    assert output.shape[0] == inputs.shape[0]
++    assert inputs.dtype == torch.bfloat16
++    assert output.dtype == torch.bfloat16
++    assert inputs.is_contiguous()
++    assert output.is_contiguous()
++
++    if not isinstance(inputs, FakeTensor):
++        moe_sum_decode_kernel[(5, inputs.shape[0])](
++            inputs,
++            output,
++            size=2560,
++            top_k=8,
++            BLOCK_K=512,
++            num_warps=4,
++            num_stages=2,
++        )
++    return output
++
++
+ @triton.jit
+ def moe_fused_mul_sum_kernel(
+     inputs_ptr,
+diff --git a/vllm/v1/attention/backends/mla/prefill/flash_attn.py b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+index 054895a8c..05c4f538b 100644
+--- a/vllm/v1/attention/backends/mla/prefill/flash_attn.py
++++ b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+@@ -643,6 +643,14 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
+         if attn_out.stride(0) != attn_out.shape[1] * attn_out.stride(1):
+             attn_out = attn_out.contiguous()
+ 
++        # The upstream FlashAttention Triton backend on ROCm returns varlen
++        # LSE as [total_q, num_heads], despite documenting (and fake-tensor
++        # modeling) [num_heads, total_q]. vLLM's MLA merge contract uses the
++        # latter layout. Normalize at the adapter boundary so multi-request
++        # cached-prefix prefills do not fail while accumulating context chunks.
++        if not self._is_vllm_fa and lse is not None:
++            lse = lse.transpose(0, 1).contiguous()
++
+         # Remain consistent with old `flash_attn_varlen_func` where there
+         # is only one output tensor if `return_softmax_lse` is False.
+         if return_softmax_lse:
+diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
+index b3f748e58..c35e1aadc 100644
+--- a/vllm/v1/attention/ops/merge_attn_states.py
++++ b/vllm/v1/attention/ops/merge_attn_states.py
+@@ -3,6 +3,7 @@
+ 
+ import torch
+ 
++from vllm import envs
+ from vllm.platforms import current_platform
+ 
+ 
+@@ -111,6 +112,22 @@ def merge_attn_states(
+             When provided, output must be FP8 dtype.
+ 
+     """
++
++    if (
++        current_platform.is_rocm()
++        and envs.VLLM_ROCM_SAFE_MERGE_ATTN_STATES
++        and output_scale is None
++    ):
++        return _merge_attn_states_torch(
++            output,
++            prefix_output,
++            prefix_lse,
++            suffix_output,
++            suffix_lse,
++            output_lse,
++            prefill_tokens_with_context,
++        )
++
+     # Both the CUDA and Triton kernels derive the suffix head stride from
+     # prefix_output, so suffix_output must share the same head stride.
+     assert prefix_output.stride(1) == suffix_output.stride(1), (
